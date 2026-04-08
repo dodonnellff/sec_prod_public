@@ -304,7 +304,7 @@ catch {
 finally {
     Disconnect-MgGraph -ErrorAction SilentlyContinue
     Write-Host "Record the following values to add into KnowBe4 Console"
-    Write-Host "Certificate Thumbprint (SHA256): $activeThumbprint"
+    Write-Host "Certificate Thumbprint (SHA-1): $activeThumbprint"
     Write-Host "IdP SSO Target URL: https://login.microsoftonline.com/$TenantID/saml2"
     Stop-Transcript | Out-Null
 }
