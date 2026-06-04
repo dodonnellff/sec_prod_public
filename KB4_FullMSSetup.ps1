@@ -70,18 +70,43 @@ try {
     Write-Host "Step 1: Connecting to Exchange Online"
     Connect-ExchangeOnline -Organization $TenantID
 
-    # ------------------------------------------------------------
-    # Mail Whitelisting
-    # ------------------------------------------------------------
-    $ruleName = "Check Point - Protect"
-    $rule = Get-TransportRule -Identity $ruleName -ErrorAction SilentlyContinue
+ 	# ------------------------------------------------------------
+	# Mail Whitelisting
+	# ------------------------------------------------------------
+	$ruleNames = @(
+		"Check Point - Protect",
+		"Avanan - Protect"
+	)
 
-    if ($rule) {
-        $header = Get-TransportRule -Identity $ruleName | Select-Object -ExpandProperty SetHeaderValue
-        New-TransportRule -Name "KnowBe4 Whitelisting" -SenderIpRanges "147.160.167.0/26","23.21.109.197","23.21.109.212","52.49.201.246","52.49.235.189" -SetHeaderName "X-CLOUD-SEC-AV-Info" -SetHeaderValue "$header" -Priority 0 -StopRuleProcessing $true
-    } else {
-        New-TransportRule -Name "KnowBe4 Whitelisting" -SenderIpRanges "147.160.167.0/26","23.21.109.197","23.21.109.212","52.49.201.246","52.49.235.189" -Priority 0 -StopRuleProcessing $true
-    }
+	$rule = $null
+	$ruleName = $null
+
+	foreach ($name in $ruleNames) {
+		$rule = Get-TransportRule -Identity $name -ErrorAction SilentlyContinue
+
+		if ($rule) {
+			$ruleName = $name
+			break
+		}
+	}
+
+	if ($rule) {
+		$header = $rule | Select-Object -ExpandProperty SetHeaderValue
+
+		New-TransportRule `
+			-Name "KnowBe4 Whitelisting" `
+			-SenderIpRanges "147.160.167.0/26","23.21.109.197","23.21.109.212","52.49.201.246","52.49.235.189" `
+			-SetHeaderName "X-CLOUD-SEC-AV-Info" `
+			-SetHeaderValue "$header" `
+			-Priority 0 `
+			-StopRuleProcessing $true
+	} else {
+		New-TransportRule `
+			-Name "KnowBe4 Whitelisting" `
+			-SenderIpRanges "147.160.167.0/26","23.21.109.197","23.21.109.212","52.49.201.246","52.49.235.189" `
+			-Priority 0 `
+			-StopRuleProcessing $true
+	}
 
     # ------------------------------------------------------------
     # PhishSim Override
