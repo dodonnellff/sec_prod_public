@@ -1,0 +1,735 @@
+$ErrorActionPreference = "Stop"
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+$DaysBack = 30
+
+$RequiredScopes = @(
+    "AuditLog.Read.All"
+    "User.Read.All"
+)
+
+$RequiredModules = @(
+    "Microsoft.Graph.Authentication"
+    "Microsoft.Graph.Reports"
+    "Microsoft.Graph.Users"
+)
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+function ConvertTo-ReportDate {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        $DateValue
+    )
+
+    if (
+        $null -eq $DateValue -or
+        [string]::IsNullOrWhiteSpace([string]$DateValue)
+    ) {
+        return "Never"
+    }
+
+    try {
+        $ParsedDate = [datetimeoffset]::Parse(
+            [string]$DateValue,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+
+        return $ParsedDate.ToLocalTime().ToString(
+            "yyyy-MM-dd HH:mm:ss zzz"
+        )
+    }
+    catch {
+        return [string]$DateValue
+    }
+}
+
+function Export-ReportCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Report,
+
+        [Parameter(Mandatory)]
+        [string[]]$Columns,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$ReportName
+    )
+
+    $Rows = @(
+        $Report |
+            Sort-Object -Property "User Name" |
+            Select-Object -Property $Columns
+    )
+
+    if ($Rows.Count -gt 0) {
+        $Rows |
+            Export-Csv `
+                -LiteralPath $Path `
+                -NoTypeInformation `
+                -Encoding UTF8 `
+                -Force
+    }
+    else {
+        # Create a CSV containing the correct headers but no data rows.
+        $EmptyRow = [ordered]@{}
+
+        foreach ($Column in $Columns) {
+            $EmptyRow[$Column] = $null
+        }
+
+        [PSCustomObject]$EmptyRow |
+            Export-Csv `
+                -LiteralPath $Path `
+                -NoTypeInformation `
+                -Encoding UTF8 `
+                -Force
+
+        $CsvContent = @(
+            Get-Content -LiteralPath $Path
+        )
+
+        if ($CsvContent.Count -gt 0) {
+            Set-Content `
+                -LiteralPath $Path `
+                -Value $CsvContent[0] `
+                -Encoding UTF8
+        }
+    }
+
+    Write-Host (
+        "{0}: {1:N0} users" -f
+        $ReportName,
+        $Rows.Count
+    ) -ForegroundColor Green
+
+    Write-Host "Output: $Path" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# Check and install required modules
+# ---------------------------------------------------------------------------
+
+$MissingModules = @(
+    foreach ($ModuleName in $RequiredModules) {
+        if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+            $ModuleName
+        }
+    }
+)
+
+if ($MissingModules.Count -gt 0) {
+    Write-Host "Installing required Microsoft Graph modules..." `
+        -ForegroundColor Yellow
+
+    foreach ($ModuleName in $MissingModules) {
+        Write-Host "Installing $ModuleName..." `
+            -ForegroundColor Yellow
+
+        Install-Module `
+            -Name $ModuleName `
+            -Scope CurrentUser `
+            -Repository PSGallery `
+            -Force `
+            -AllowClobber `
+            -ErrorAction Stop
+    }
+}
+
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Import-Module Microsoft.Graph.Reports -ErrorAction Stop
+Import-Module Microsoft.Graph.Users -ErrorAction Stop
+
+# ---------------------------------------------------------------------------
+# Request and validate client code
+# ---------------------------------------------------------------------------
+
+do {
+    $ClientCode = (
+        Read-Host "Enter the Client Code"
+    ).Trim().ToUpperInvariant()
+
+    if ([string]::IsNullOrWhiteSpace($ClientCode)) {
+        Write-Warning "Client Code cannot be blank."
+        $ClientCodeIsValid = $false
+    }
+    elseif ($ClientCode -notmatch '^[A-Z0-9_-]+$') {
+        Write-Warning (
+            "Client Code may only contain letters, numbers, underscores, " +
+            "and hyphens."
+        )
+
+        $ClientCodeIsValid = $false
+    }
+    else {
+        $ClientCodeIsValid = $true
+    }
+}
+until ($ClientCodeIsValid)
+
+# ---------------------------------------------------------------------------
+# Build output paths
+# ---------------------------------------------------------------------------
+
+$OutputDirectory = Join-Path `
+    -Path "C:\Temp" `
+    -ChildPath $ClientCode
+
+$AllUsersOutputPath = Join-Path `
+    -Path $OutputDirectory `
+    -ChildPath "UserSignInReport.csv"
+
+$MembersOutputPath = Join-Path `
+    -Path $OutputDirectory `
+    -ChildPath "UserSignInReport-Members.csv"
+
+$NoRecentSignInsOutputPath = Join-Path `
+    -Path $OutputDirectory `
+    -ChildPath "UserSignInReport-Enabled-No-Recent-SignIns.csv"
+
+$GuestsUnknownOutputPath = Join-Path `
+    -Path $OutputDirectory `
+    -ChildPath "UserSignInReport-Guests-Unknown.csv"
+
+if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+    New-Item `
+        -Path $OutputDirectory `
+        -ItemType Directory `
+        -Force `
+        -ErrorAction Stop |
+        Out-Null
+}
+
+Write-Host ""
+Write-Host "Client Code: $ClientCode" -ForegroundColor Cyan
+Write-Host "Interactive report period: Last $DaysBack days" `
+    -ForegroundColor Cyan
+Write-Host "Output directory: $OutputDirectory" `
+    -ForegroundColor Cyan
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Connect once using WAM
+# ---------------------------------------------------------------------------
+
+try {
+    Write-Host "Connecting to Microsoft Graph..." `
+        -ForegroundColor Cyan
+
+    # WAM is used by default on supported Windows systems.
+    # This is the only Connect-MgGraph call in the script.
+    Connect-MgGraph `
+        -Scopes $RequiredScopes `
+        -ContextScope Process `
+        -NoWelcome `
+        -ErrorAction Stop
+
+    $GraphContext = Get-MgContext
+
+    if (-not $GraphContext) {
+        throw (
+            "Microsoft Graph authentication did not return a valid context."
+        )
+    }
+
+    Write-Host (
+        "Connected to Microsoft Graph as {0}" -f
+        $GraphContext.Account
+    ) -ForegroundColor Green
+
+    # -----------------------------------------------------------------------
+    # Retrieve all Entra users and sign-in activity
+    # -----------------------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Retrieving Entra users and last sign-in activity..." `
+        -ForegroundColor Cyan
+
+    $Users = @(
+        Get-MgUser `
+            -All `
+            -Property @(
+                "Id"
+                "DisplayName"
+                "UserPrincipalName"
+                "UserType"
+                "UsageLocation"
+                "AccountEnabled"
+                "SignInActivity"
+            ) `
+            -ConsistencyLevel eventual `
+            -CountVariable UserCount `
+            -ErrorAction Stop
+    )
+
+    $UserLookup = @{}
+
+    foreach ($User in $Users) {
+        $UserLookup[$User.Id] = $User
+    }
+
+    Write-Host (
+        "Retrieved {0:N0} Entra users." -f
+        $Users.Count
+    ) -ForegroundColor Green
+
+    # -----------------------------------------------------------------------
+    # Retrieve successful interactive sign-ins only
+    # -----------------------------------------------------------------------
+
+    $StartDate = (
+        Get-Date
+    ).ToUniversalTime().AddDays(-$DaysBack)
+
+    $StartDateFilter = $StartDate.ToString(
+        "yyyy-MM-ddTHH:mm:ssZ"
+    )
+
+    $Filter = (
+        "createdDateTime ge {0} and " +
+        "status/errorCode eq 0 and " +
+        "isInteractive eq true"
+    ) -f $StartDateFilter
+
+    Write-Host ""
+    Write-Host (
+        "Retrieving successful interactive sign-ins since {0} UTC..." -f
+        $StartDate.ToString("yyyy-MM-dd HH:mm:ss")
+    ) -ForegroundColor Cyan
+
+    $InteractiveSignIns = @(
+        Get-MgAuditLogSignIn `
+            -All `
+            -Filter $Filter `
+            -Property @(
+                "Id"
+                "CreatedDateTime"
+                "UserId"
+                "UserDisplayName"
+                "UserPrincipalName"
+                "Location"
+                "Status"
+                "IsInteractive"
+            ) `
+            -ErrorAction Stop
+    )
+
+    Write-Host (
+        "Retrieved {0:N0} successful interactive sign-ins." -f
+        $InteractiveSignIns.Count
+    ) -ForegroundColor Green
+
+    # -----------------------------------------------------------------------
+    # Normalise interactive sign-ins
+    # -----------------------------------------------------------------------
+
+    $NormalisedSignIns = @(
+        foreach ($SignIn in $InteractiveSignIns) {
+            if (
+                [string]::IsNullOrWhiteSpace(
+                    $SignIn.UserId
+                )
+            ) {
+                continue
+            }
+
+            $Country = $SignIn.Location.CountryOrRegion
+
+            if ([string]::IsNullOrWhiteSpace($Country)) {
+                $Country = "Unknown"
+            }
+            else {
+                $Country = (
+                    $Country.Trim().ToUpperInvariant()
+                )
+            }
+
+            [PSCustomObject]@{
+                Id                = $SignIn.Id
+                CreatedDateTime   = $SignIn.CreatedDateTime
+                UserId            = $SignIn.UserId
+                UserDisplayName   = $SignIn.UserDisplayName
+                UserPrincipalName = $SignIn.UserPrincipalName
+                Country           = $Country
+            }
+        }
+    )
+
+    # -----------------------------------------------------------------------
+    # Determine dynamic country columns
+    # -----------------------------------------------------------------------
+
+    $KnownCountries = @(
+        $NormalisedSignIns.Country |
+            Where-Object {
+                $_ -ne "Unknown"
+            } |
+            Sort-Object -Unique
+    )
+
+    $Countries = @(
+        $KnownCountries
+    )
+
+    if ($NormalisedSignIns.Country -contains "Unknown") {
+        $Countries += "Unknown"
+    }
+
+    # -----------------------------------------------------------------------
+    # Create sign-in lookup by user ID
+    # -----------------------------------------------------------------------
+
+    $SignInsByUserId = @{}
+
+    foreach (
+        $UserGroup in (
+            $NormalisedSignIns |
+                Group-Object -Property UserId
+        )
+    ) {
+        $SignInsByUserId[$UserGroup.Name] = @(
+            $UserGroup.Group
+        )
+    }
+
+    # -----------------------------------------------------------------------
+    # Select users to include
+    # -----------------------------------------------------------------------
+
+    # Include every enabled Member, including users with no successful
+    # interactive sign-ins during the reporting period.
+    $EnabledMembers = @(
+        $Users |
+            Where-Object {
+                $_.UserType -eq "Member" -and
+                $_.AccountEnabled -eq $true
+            }
+    )
+
+    # Other user types are included when they have a successful interactive
+    # sign-in during the reporting period.
+    $RecentSignInUserIds = @(
+        $NormalisedSignIns.UserId |
+            Sort-Object -Unique
+    )
+
+    $IncludedUsersById = @{}
+
+    foreach ($Member in $EnabledMembers) {
+        $IncludedUsersById[$Member.Id] = $Member
+    }
+
+    foreach ($UserId in $RecentSignInUserIds) {
+        if ($UserLookup.ContainsKey($UserId)) {
+            $IncludedUsersById[$UserId] = $UserLookup[$UserId]
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # Build internal report
+    # -----------------------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Building country summaries..." `
+        -ForegroundColor Cyan
+
+    $InternalReport = @(
+        foreach ($User in $IncludedUsersById.Values) {
+            $UserId = $User.Id
+
+            if (
+                [string]::IsNullOrWhiteSpace(
+                    $User.DisplayName
+                )
+            ) {
+                $UserName = $User.UserPrincipalName
+            }
+            else {
+                $UserName = $User.DisplayName
+            }
+
+            $UserPrincipalName = $User.UserPrincipalName
+
+            if (
+                [string]::IsNullOrWhiteSpace(
+                    $User.UserType
+                )
+            ) {
+                $UserType = "Unknown"
+            }
+            else {
+                $UserType = $User.UserType.Trim()
+            }
+
+            if (
+                [string]::IsNullOrWhiteSpace(
+                    $User.UsageLocation
+                )
+            ) {
+                $UsageLocation = "Not Set"
+            }
+            else {
+                $UsageLocation = (
+                    $User.UsageLocation.Trim().ToUpperInvariant()
+                )
+            }
+
+            if ($null -eq $User.AccountEnabled) {
+                $AccountEnabled = "Unknown"
+            }
+            elseif ($User.AccountEnabled -eq $true) {
+                $AccountEnabled = "Yes"
+            }
+            else {
+                $AccountEnabled = "No"
+            }
+
+            $LastInteractiveSignIn = ConvertTo-ReportDate `
+                -DateValue (
+                    $User.SignInActivity.LastSignInDateTime
+                )
+
+            $LastNonInteractiveSignIn = ConvertTo-ReportDate `
+                -DateValue (
+                    $User.SignInActivity.LastNonInteractiveSignInDateTime
+                )
+
+            if ($SignInsByUserId.ContainsKey($UserId)) {
+                $UserSignIns = @(
+                    $SignInsByUserId[$UserId]
+                )
+            }
+            else {
+                $UserSignIns = @()
+            }
+
+            $CountryCounts = @{}
+
+            foreach (
+                $CountryGroup in (
+                    $UserSignIns |
+                        Group-Object -Property Country
+                )
+            ) {
+                $CountryCounts[$CountryGroup.Name] = (
+                    $CountryGroup.Count
+                )
+            }
+
+            $Row = [ordered]@{
+                "User Name"                      = $UserName
+                "User Principal Name"            = $UserPrincipalName
+                "User Type"                      = $UserType
+                "Account Enabled"                = $AccountEnabled
+                "Usage Location"                 = $UsageLocation
+                "Last Interactive Sign-in"       = $LastInteractiveSignIn
+                "Last Non-Interactive Sign-in"   = $LastNonInteractiveSignIn
+                "Interactive Sign-ins in Period" = $UserSignIns.Count
+            }
+
+            foreach ($Country in $Countries) {
+                if ($CountryCounts.ContainsKey($Country)) {
+                    $Row[$Country] = $CountryCounts[$Country]
+                }
+                else {
+                    $Row[$Country] = 0
+                }
+            }
+
+            # Unknown locations are excluded from the unique-country count.
+            $UserKnownCountries = @(
+                $CountryCounts.Keys |
+                    Where-Object {
+                        $_ -ne "Unknown"
+                    } |
+                    Sort-Object -Unique
+            )
+
+            $Row["Unique Country Count"] = (
+                $UserKnownCountries.Count
+            )
+
+            if ($UserKnownCountries.Count -eq 0) {
+                $OutsideUsageLocation = "No Recent Sign-ins"
+            }
+            elseif ($UsageLocation -in @("Not Set", "Unknown")) {
+                $OutsideUsageLocation = "Unknown"
+            }
+            elseif (
+                @(
+                    $UserKnownCountries |
+                        Where-Object {
+                            $_ -ne $UsageLocation
+                        }
+                ).Count -gt 0
+            ) {
+                $OutsideUsageLocation = "Yes"
+            }
+            else {
+                $OutsideUsageLocation = "No"
+            }
+
+            $Row["Sign-ins Outside Usage Location"] = (
+                $OutsideUsageLocation
+            )
+
+            [PSCustomObject]$Row
+        }
+    )
+
+    # -----------------------------------------------------------------------
+    # Define report columns
+    # -----------------------------------------------------------------------
+
+    $CommonLeadingColumns = @(
+        "User Name"
+        "User Principal Name"
+        "User Type"
+        "Usage Location"
+        "Last Interactive Sign-in"
+        "Last Non-Interactive Sign-in"
+        "Interactive Sign-ins in Period"
+    )
+
+    $MemberLeadingColumns = @(
+        "User Name"
+        "User Principal Name"
+        "User Type"
+        "Account Enabled"
+        "Usage Location"
+        "Last Interactive Sign-in"
+        "Last Non-Interactive Sign-in"
+        "Interactive Sign-ins in Period"
+    )
+
+    $TrailingColumns = @(
+        "Unique Country Count"
+        "Sign-ins Outside Usage Location"
+    )
+
+    $AllUsersColumns = @(
+        $CommonLeadingColumns +
+        $Countries +
+        $TrailingColumns
+    )
+
+    $MemberColumns = @(
+        $MemberLeadingColumns +
+        $Countries +
+        $TrailingColumns
+    )
+
+    # -----------------------------------------------------------------------
+    # Split reports
+    # -----------------------------------------------------------------------
+
+    $AllUsersReport = @(
+        $InternalReport
+    )
+
+    $MembersReport = @(
+        $InternalReport |
+            Where-Object {
+                $_."User Type" -eq "Member" -and
+                $_."Account Enabled" -eq "Yes"
+            }
+    )
+
+    $EnabledMembersNoRecentSignInsReport = @(
+        $InternalReport |
+            Where-Object {
+                $_."User Type" -eq "Member" -and
+                $_."Account Enabled" -eq "Yes" -and
+                [int]$_."Interactive Sign-ins in Period" -eq 0
+            }
+    )
+
+    $GuestsUnknownReport = @(
+        $InternalReport |
+            Where-Object {
+                $_."User Type" -in @(
+                    "Guest"
+                    "Unknown"
+                )
+            }
+    )
+
+    # -----------------------------------------------------------------------
+    # Export reports
+    # -----------------------------------------------------------------------
+
+    Write-Host ""
+
+    Export-ReportCsv `
+        -Report $AllUsersReport `
+        -Columns $AllUsersColumns `
+        -Path $AllUsersOutputPath `
+        -ReportName "All users report"
+
+    Write-Host ""
+
+    Export-ReportCsv `
+        -Report $MembersReport `
+        -Columns $MemberColumns `
+        -Path $MembersOutputPath `
+        -ReportName "Enabled Member report"
+
+    Write-Host ""
+
+    Export-ReportCsv `
+        -Report $EnabledMembersNoRecentSignInsReport `
+        -Columns $MemberColumns `
+        -Path $NoRecentSignInsOutputPath `
+        -ReportName (
+            "Enabled Members with no recent interactive sign-ins"
+        )
+
+    Write-Host ""
+
+    Export-ReportCsv `
+        -Report $GuestsUnknownReport `
+        -Columns $AllUsersColumns `
+        -Path $GuestsUnknownOutputPath `
+        -ReportName "Guest or Unknown report"
+
+    Write-Host ""
+    Write-Host "All reports completed successfully." `
+        -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+
+    Write-Error (
+        "The reports could not be completed: {0}" -f
+        $_.Exception.Message
+    )
+}
+finally {
+    # -----------------------------------------------------------------------
+    # Disconnect from Microsoft Graph
+    # -----------------------------------------------------------------------
+
+    if (Get-MgContext) {
+        Write-Host ""
+        Write-Host "Disconnecting from Microsoft Graph..." `
+            -ForegroundColor Cyan
+
+        Disconnect-MgGraph `
+            -ErrorAction SilentlyContinue |
+            Out-Null
+
+        Write-Host "Disconnected from Microsoft Graph." `
+            -ForegroundColor Green
+    }
+}
