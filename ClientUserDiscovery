@@ -50,6 +50,90 @@ function ConvertTo-ReportDate {
     }
 }
 
+function Get-TargetedNonInteractiveSignIns {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$UserId,
+
+        [Parameter(Mandatory)]
+        [datetime]$StartDate
+    )
+
+    $StartDateText = $StartDate.ToUniversalTime().ToString(
+        "yyyy-MM-ddTHH:mm:ssZ"
+    )
+
+    $Filter = (
+        "userId eq '{0}' and " +
+        "createdDateTime ge {1} and " +
+        "status/errorCode eq 0 and " +
+        "signInEventTypes/any(t:t eq 'nonInteractiveUser')"
+    ) -f $UserId, $StartDateText
+
+    $SelectProperties = @(
+        "id"
+        "createdDateTime"
+        "userId"
+        "userPrincipalName"
+        "location"
+        "status"
+        "signInEventTypes"
+    ) -join ","
+
+    $EncodedFilter = [uri]::EscapeDataString($Filter)
+
+    $RequestUri = (
+        "https://graph.microsoft.com/beta/auditLogs/signIns" +
+        "?`$filter=$EncodedFilter" +
+        "&`$select=$SelectProperties" +
+        "&`$top=1000"
+    )
+
+    $Records = [System.Collections.Generic.List[object]]::new()
+    $PageNumber = 0
+
+    while (-not [string]::IsNullOrWhiteSpace($RequestUri)) {
+        $PageNumber++
+
+        Write-Host (
+            "    Retrieving targeted non-interactive page {0}..." -f
+            $PageNumber
+        ) -ForegroundColor DarkCyan
+
+        $Response = Invoke-MgGraphRequest `
+            -Method GET `
+            -Uri $RequestUri `
+            -OutputType PSObject `
+            -ErrorAction Stop
+
+        foreach ($Record in @($Response.value)) {
+            $Country = $Record.location.countryOrRegion
+
+            if ([string]::IsNullOrWhiteSpace($Country)) {
+                $Country = "Unknown"
+            }
+            else {
+                $Country = $Country.Trim().ToUpperInvariant()
+            }
+
+            $Records.Add(
+                [PSCustomObject]@{
+                    Id                = $Record.id
+                    CreatedDateTime   = $Record.createdDateTime
+                    UserId            = $Record.userId
+                    UserPrincipalName = $Record.userPrincipalName
+                    Country           = $Country
+                }
+            )
+        }
+
+        $RequestUri = $Response.'@odata.nextLink'
+    }
+
+    return $Records.ToArray()
+}
+
 function Export-ReportCsv {
     [CmdletBinding()]
     param(
@@ -82,7 +166,7 @@ function Export-ReportCsv {
                 -Force
     }
     else {
-        # Create a CSV containing the correct headers but no data rows.
+        # Create a CSV with the correct headers and no data rows.
         $EmptyRow = [ordered]@{}
 
         foreach ($Column in $Columns) {
@@ -194,13 +278,17 @@ $MembersOutputPath = Join-Path `
     -Path $OutputDirectory `
     -ChildPath "UserSignInReport-Members.csv"
 
-$NoRecentSignInsOutputPath = Join-Path `
+$InactiveUsersOutputPath = Join-Path `
     -Path $OutputDirectory `
-    -ChildPath "UserSignInReport-Enabled-No-Recent-SignIns.csv"
+    -ChildPath "UserSignInReport-Inactive-Users.csv"
 
 $GuestsUnknownOutputPath = Join-Path `
     -Path $OutputDirectory `
     -ChildPath "UserSignInReport-Guests-Unknown.csv"
+
+$ExceptionsOutputPath = Join-Path `
+    -Path $OutputDirectory `
+    -ChildPath "UserSignInReport-Exceptions.csv"
 
 if (-not (Test-Path -LiteralPath $OutputDirectory)) {
     New-Item `
@@ -213,10 +301,13 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 
 Write-Host ""
 Write-Host "Client Code: $ClientCode" -ForegroundColor Cyan
-Write-Host "Interactive report period: Last $DaysBack days" `
+
+Write-Host "Sign-in report period: Last $DaysBack days" `
     -ForegroundColor Cyan
+
 Write-Host "Output directory: $OutputDirectory" `
     -ForegroundColor Cyan
+
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -249,7 +340,7 @@ try {
     ) -ForegroundColor Green
 
     # -----------------------------------------------------------------------
-    # Retrieve all Entra users and sign-in activity
+    # Retrieve Entra users and sign-in activity
     # -----------------------------------------------------------------------
 
     Write-Host ""
@@ -285,7 +376,7 @@ try {
     ) -ForegroundColor Green
 
     # -----------------------------------------------------------------------
-    # Retrieve successful interactive sign-ins only
+    # Set the reporting-period start date
     # -----------------------------------------------------------------------
 
     $StartDate = (
@@ -296,7 +387,11 @@ try {
         "yyyy-MM-ddTHH:mm:ssZ"
     )
 
-    $Filter = (
+    # -----------------------------------------------------------------------
+    # Retrieve successful interactive sign-ins
+    # -----------------------------------------------------------------------
+
+    $InteractiveFilter = (
         "createdDateTime ge {0} and " +
         "status/errorCode eq 0 and " +
         "isInteractive eq true"
@@ -311,7 +406,7 @@ try {
     $InteractiveSignIns = @(
         Get-MgAuditLogSignIn `
             -All `
-            -Filter $Filter `
+            -Filter $InteractiveFilter `
             -Property @(
                 "Id"
                 "CreatedDateTime"
@@ -334,7 +429,7 @@ try {
     # Normalise interactive sign-ins
     # -----------------------------------------------------------------------
 
-    $NormalisedSignIns = @(
+    $NormalisedInteractiveSignIns = @(
         foreach ($SignIn in $InteractiveSignIns) {
             if (
                 [string]::IsNullOrWhiteSpace(
@@ -367,12 +462,183 @@ try {
     )
 
     # -----------------------------------------------------------------------
+    # Create interactive sign-in lookup by user ID
+    # -----------------------------------------------------------------------
+
+    $InteractiveSignInsByUserId = @{}
+
+    foreach (
+        $UserGroup in (
+            $NormalisedInteractiveSignIns |
+                Group-Object -Property UserId
+        )
+    ) {
+        $InteractiveSignInsByUserId[$UserGroup.Name] = @(
+            $UserGroup.Group
+        )
+    }
+
+    # -----------------------------------------------------------------------
+    # Identify enabled Members
+    # -----------------------------------------------------------------------
+
+    $EnabledMembers = @(
+        $Users |
+            Where-Object {
+                $_.UserType -eq "Member" -and
+                $_.AccountEnabled -eq $true
+            }
+    )
+
+    Write-Host ""
+    Write-Host (
+        "Found {0:N0} enabled Member accounts." -f
+        $EnabledMembers.Count
+    ) -ForegroundColor Green
+
+    # -----------------------------------------------------------------------
+    # Identify targeted non-interactive lookup users
+    # -----------------------------------------------------------------------
+
+    # The targeted lookup only applies to enabled Members who:
+    #   - Have no successful interactive sign-ins in the report period
+    #   - Have a last non-interactive sign-in date
+    #   - Have a last non-interactive date within the report period
+
+    $TargetUsers = @(
+        foreach ($Member in $EnabledMembers) {
+            $MemberId = $Member.Id
+
+            if (
+                $InteractiveSignInsByUserId.ContainsKey(
+                    $MemberId
+                )
+            ) {
+                $InteractiveCount = @(
+                    $InteractiveSignInsByUserId[$MemberId]
+                ).Count
+            }
+            else {
+                $InteractiveCount = 0
+            }
+
+            $LastNonInteractiveValue = (
+                $Member.SignInActivity.
+                    LastNonInteractiveSignInDateTime
+            )
+
+            $HasLastNonInteractiveValue = -not (
+                [string]::IsNullOrWhiteSpace(
+                    [string]$LastNonInteractiveValue
+                )
+            )
+
+            $LastNonInteractiveWithinPeriod = $false
+
+            if ($HasLastNonInteractiveValue) {
+                try {
+                    $LastNonInteractiveDate = (
+                        [datetimeoffset]::Parse(
+                            [string]$LastNonInteractiveValue,
+                            [System.Globalization.CultureInfo]::
+                                InvariantCulture
+                        )
+                    ).UtcDateTime
+
+                    $LastNonInteractiveWithinPeriod = (
+                        $LastNonInteractiveDate -ge $StartDate
+                    )
+                }
+                catch {
+                    $LastNonInteractiveWithinPeriod = $false
+                }
+            }
+
+            if (
+                $InteractiveCount -eq 0 -and
+                $HasLastNonInteractiveValue -and
+                $LastNonInteractiveWithinPeriod
+            ) {
+                $Member
+            }
+        }
+    )
+
+    # -----------------------------------------------------------------------
+    # Run targeted non-interactive lookups
+    # -----------------------------------------------------------------------
+
+    $TargetedNonInteractiveByUserId = @{}
+    $AllTargetedNonInteractiveSignIns = @()
+
+    Write-Host ""
+    Write-Host (
+        "Running targeted non-interactive lookups for {0:N0} users..." -f
+        $TargetUsers.Count
+    ) -ForegroundColor Cyan
+
+    $CurrentTarget = 0
+
+    foreach ($TargetUser in $TargetUsers) {
+        $CurrentTarget++
+
+        Write-Host (
+            "  [{0}/{1}] {2}" -f
+            $CurrentTarget,
+            $TargetUsers.Count,
+            $TargetUser.UserPrincipalName
+        ) -ForegroundColor Cyan
+
+        try {
+            $UserNonInteractiveSignIns = @(
+                Get-TargetedNonInteractiveSignIns `
+                    -UserId $TargetUser.Id `
+                    -StartDate $StartDate
+            )
+
+            $TargetedNonInteractiveByUserId[
+                $TargetUser.Id
+            ] = @(
+                $UserNonInteractiveSignIns
+            )
+
+            if ($UserNonInteractiveSignIns.Count -gt 0) {
+                $AllTargetedNonInteractiveSignIns += @(
+                    $UserNonInteractiveSignIns
+                )
+            }
+
+            Write-Host (
+                "    Retrieved {0:N0} successful non-interactive sign-ins." -f
+                $UserNonInteractiveSignIns.Count
+            ) -ForegroundColor Green
+        }
+        catch {
+            Write-Warning (
+                "Targeted lookup failed for {0}: {1}" -f
+                $TargetUser.UserPrincipalName,
+                $_.Exception.Message
+            )
+
+            $TargetedNonInteractiveByUserId[
+                $TargetUser.Id
+            ] = @()
+        }
+    }
+
+    # -----------------------------------------------------------------------
     # Determine dynamic country columns
     # -----------------------------------------------------------------------
 
+    $AllObservedCountries = @(
+        @($NormalisedInteractiveSignIns.Country) +
+        @($AllTargetedNonInteractiveSignIns.Country)
+    )
+
     $KnownCountries = @(
-        $NormalisedSignIns.Country |
+        $AllObservedCountries |
             Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_) -and
                 $_ -ne "Unknown"
             } |
             Sort-Object -Unique
@@ -382,66 +648,42 @@ try {
         $KnownCountries
     )
 
-    if ($NormalisedSignIns.Country -contains "Unknown") {
+    if ($AllObservedCountries -contains "Unknown") {
         $Countries += "Unknown"
     }
 
     # -----------------------------------------------------------------------
-    # Create sign-in lookup by user ID
+    # Select users for the internal report
     # -----------------------------------------------------------------------
-
-    $SignInsByUserId = @{}
-
-    foreach (
-        $UserGroup in (
-            $NormalisedSignIns |
-                Group-Object -Property UserId
-        )
-    ) {
-        $SignInsByUserId[$UserGroup.Name] = @(
-            $UserGroup.Group
-        )
-    }
-
-    # -----------------------------------------------------------------------
-    # Select users to include
-    # -----------------------------------------------------------------------
-
-    # Include every enabled Member, including users with no successful
-    # interactive sign-ins during the reporting period.
-    $EnabledMembers = @(
-        $Users |
-            Where-Object {
-                $_.UserType -eq "Member" -and
-                $_.AccountEnabled -eq $true
-            }
-    )
-
-    # Other user types are included when they have a successful interactive
-    # sign-in during the reporting period.
-    $RecentSignInUserIds = @(
-        $NormalisedSignIns.UserId |
-            Sort-Object -Unique
-    )
 
     $IncludedUsersById = @{}
 
+    # Include every enabled Member.
     foreach ($Member in $EnabledMembers) {
         $IncludedUsersById[$Member.Id] = $Member
     }
 
-    foreach ($UserId in $RecentSignInUserIds) {
+    # Include other user types when they have a successful interactive
+    # sign-in during the report period.
+    $RecentInteractiveUserIds = @(
+        $NormalisedInteractiveSignIns.UserId |
+            Sort-Object -Unique
+    )
+
+    foreach ($UserId in $RecentInteractiveUserIds) {
         if ($UserLookup.ContainsKey($UserId)) {
-            $IncludedUsersById[$UserId] = $UserLookup[$UserId]
+            $IncludedUsersById[$UserId] = (
+                $UserLookup[$UserId]
+            )
         }
     }
 
     # -----------------------------------------------------------------------
-    # Build internal report
+    # Build the internal report
     # -----------------------------------------------------------------------
 
     Write-Host ""
-    Write-Host "Building country summaries..." `
+    Write-Host "Building user and country summaries..." `
         -ForegroundColor Cyan
 
     $InternalReport = @(
@@ -481,7 +723,9 @@ try {
             }
             else {
                 $UsageLocation = (
-                    $User.UsageLocation.Trim().ToUpperInvariant()
+                    $User.UsageLocation.
+                        Trim().
+                        ToUpperInvariant()
                 )
             }
 
@@ -497,28 +741,82 @@ try {
 
             $LastInteractiveSignIn = ConvertTo-ReportDate `
                 -DateValue (
-                    $User.SignInActivity.LastSignInDateTime
+                    $User.SignInActivity.
+                        LastSignInDateTime
                 )
 
             $LastNonInteractiveSignIn = ConvertTo-ReportDate `
                 -DateValue (
-                    $User.SignInActivity.LastNonInteractiveSignInDateTime
+                    $User.SignInActivity.
+                        LastNonInteractiveSignInDateTime
                 )
 
-            if ($SignInsByUserId.ContainsKey($UserId)) {
-                $UserSignIns = @(
-                    $SignInsByUserId[$UserId]
+            if (
+                $InteractiveSignInsByUserId.ContainsKey(
+                    $UserId
+                )
+            ) {
+                $UserInteractiveSignIns = @(
+                    $InteractiveSignInsByUserId[$UserId]
                 )
             }
             else {
-                $UserSignIns = @()
+                $UserInteractiveSignIns = @()
+            }
+
+            if (
+                $TargetedNonInteractiveByUserId.ContainsKey(
+                    $UserId
+                )
+            ) {
+                $UserTargetedNonInteractiveSignIns = @(
+                    $TargetedNonInteractiveByUserId[$UserId]
+                )
+            }
+            else {
+                $UserTargetedNonInteractiveSignIns = @()
+            }
+
+            $InteractiveSignInCount = (
+                $UserInteractiveSignIns.Count
+            )
+
+            $TargetedNonInteractiveCount = (
+                $UserTargetedNonInteractiveSignIns.Count
+            )
+
+            $RecentSignInCount = (
+                $InteractiveSignInCount +
+                $TargetedNonInteractiveCount
+            )
+
+            # Interactive records are preferred for country reporting.
+            # Targeted non-interactive records are used when no successful
+            # interactive records exist for the user during the period.
+            if ($InteractiveSignInCount -gt 0) {
+                $CountrySourceSignIns = @(
+                    $UserInteractiveSignIns
+                )
+
+                $CountrySource = "Interactive"
+            }
+            elseif ($TargetedNonInteractiveCount -gt 0) {
+                $CountrySourceSignIns = @(
+                    $UserTargetedNonInteractiveSignIns
+                )
+
+                $CountrySource = "Targeted Non-Interactive"
+            }
+            else {
+                $CountrySourceSignIns = @()
+                $CountrySource = "No Recent Sign-ins"
             }
 
             $CountryCounts = @{}
 
             foreach (
                 $CountryGroup in (
-                    $UserSignIns |
+                    $CountrySourceSignIns |
                         Group-Object -Property Country
                 )
             ) {
@@ -528,19 +826,52 @@ try {
             }
 
             $Row = [ordered]@{
-                "User Name"                      = $UserName
-                "User Principal Name"            = $UserPrincipalName
-                "User Type"                      = $UserType
-                "Account Enabled"                = $AccountEnabled
-                "Usage Location"                 = $UsageLocation
-                "Last Interactive Sign-in"       = $LastInteractiveSignIn
-                "Last Non-Interactive Sign-in"   = $LastNonInteractiveSignIn
-                "Interactive Sign-ins in Period" = $UserSignIns.Count
+                "User Name" = $UserName
+
+                "User Principal Name" = (
+                    $UserPrincipalName
+                )
+
+                "User Type" = $UserType
+
+                "Account Enabled" = (
+                    $AccountEnabled
+                )
+
+                "Usage Location" = (
+                    $UsageLocation
+                )
+
+                "Last Interactive Sign-in" = (
+                    $LastInteractiveSignIn
+                )
+
+                "Last Non-Interactive Sign-in" = (
+                    $LastNonInteractiveSignIn
+                )
+
+                "Interactive Sign-ins in Period" = (
+                    $InteractiveSignInCount
+                )
+
+                "Targeted Non-Interactive Sign-ins" = (
+                    $TargetedNonInteractiveCount
+                )
+
+                "Recent Sign-ins" = (
+                    $RecentSignInCount
+                )
+
+                "Country Data Source" = (
+                    $CountrySource
+                )
             }
 
             foreach ($Country in $Countries) {
                 if ($CountryCounts.ContainsKey($Country)) {
-                    $Row[$Country] = $CountryCounts[$Country]
+                    $Row[$Country] = (
+                        $CountryCounts[$Country]
+                    )
                 }
                 else {
                     $Row[$Country] = 0
@@ -561,9 +892,16 @@ try {
             )
 
             if ($UserKnownCountries.Count -eq 0) {
-                $OutsideUsageLocation = "No Recent Sign-ins"
+                $OutsideUsageLocation = (
+                    "No Recent Sign-ins"
+                )
             }
-            elseif ($UsageLocation -in @("Not Set", "Unknown")) {
+            elseif (
+                $UsageLocation -in @(
+                    "Not Set"
+                    "Unknown"
+                )
+            ) {
                 $OutsideUsageLocation = "Unknown"
             }
             elseif (
@@ -600,6 +938,9 @@ try {
         "Last Interactive Sign-in"
         "Last Non-Interactive Sign-in"
         "Interactive Sign-ins in Period"
+        "Targeted Non-Interactive Sign-ins"
+        "Recent Sign-ins"
+        "Country Data Source"
     )
 
     $MemberLeadingColumns = @(
@@ -611,6 +952,9 @@ try {
         "Last Interactive Sign-in"
         "Last Non-Interactive Sign-in"
         "Interactive Sign-ins in Period"
+        "Targeted Non-Interactive Sign-ins"
+        "Recent Sign-ins"
+        "Country Data Source"
     )
 
     $TrailingColumns = @(
@@ -646,12 +990,14 @@ try {
             }
     )
 
-    $EnabledMembersNoRecentSignInsReport = @(
+    # Enabled Members with no successful interactive or targeted
+    # non-interactive sign-ins during the reporting period.
+    $InactiveUsersReport = @(
         $InternalReport |
             Where-Object {
                 $_."User Type" -eq "Member" -and
                 $_."Account Enabled" -eq "Yes" -and
-                [int]$_."Interactive Sign-ins in Period" -eq 0
+                [int]$_."Recent Sign-ins" -eq 0
             }
     )
 
@@ -662,6 +1008,15 @@ try {
                     "Guest"
                     "Unknown"
                 )
+            }
+    )
+
+    # Only users with an observed country that differs from their
+    # configured Usage Location.
+    $ExceptionsReport = @(
+        $InternalReport |
+            Where-Object {
+                $_."Sign-ins Outside Usage Location" -eq "Yes"
             }
     )
 
@@ -688,12 +1043,10 @@ try {
     Write-Host ""
 
     Export-ReportCsv `
-        -Report $EnabledMembersNoRecentSignInsReport `
+        -Report $InactiveUsersReport `
         -Columns $MemberColumns `
-        -Path $NoRecentSignInsOutputPath `
-        -ReportName (
-            "Enabled Members with no recent interactive sign-ins"
-        )
+        -Path $InactiveUsersOutputPath `
+        -ReportName "Inactive users report"
 
     Write-Host ""
 
@@ -702,6 +1055,14 @@ try {
         -Columns $AllUsersColumns `
         -Path $GuestsUnknownOutputPath `
         -ReportName "Guest or Unknown report"
+
+    Write-Host ""
+
+    Export-ReportCsv `
+        -Report $ExceptionsReport `
+        -Columns $AllUsersColumns `
+        -Path $ExceptionsOutputPath `
+        -ReportName "Usage location exceptions report"
 
     Write-Host ""
     Write-Host "All reports completed successfully." `
