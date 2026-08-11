@@ -166,7 +166,6 @@ function Export-ReportCsv {
                 -Force
     }
     else {
-        # Create a CSV with the correct headers and no data rows.
         $EmptyRow = [ordered]@{}
 
         foreach ($Column in $Columns) {
@@ -290,6 +289,10 @@ $ExceptionsOutputPath = Join-Path `
     -Path $OutputDirectory `
     -ChildPath "UserSignInReport-Exceptions.csv"
 
+$SingleCountryExceptionsOutputPath = Join-Path `
+    -Path $OutputDirectory `
+    -ChildPath "UserSignInReport-Single-Country-Exceptions.csv"
+
 if (-not (Test-Path -LiteralPath $OutputDirectory)) {
     New-Item `
         -Path $OutputDirectory `
@@ -301,13 +304,10 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 
 Write-Host ""
 Write-Host "Client Code: $ClientCode" -ForegroundColor Cyan
-
 Write-Host "Sign-in report period: Last $DaysBack days" `
     -ForegroundColor Cyan
-
 Write-Host "Output directory: $OutputDirectory" `
     -ForegroundColor Cyan
-
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -318,8 +318,6 @@ try {
     Write-Host "Connecting to Microsoft Graph..." `
         -ForegroundColor Cyan
 
-    # WAM is used by default on supported Windows systems.
-    # This is the only Connect-MgGraph call in the script.
     Connect-MgGraph `
         -Scopes $RequiredScopes `
         -ContextScope Process `
@@ -376,7 +374,7 @@ try {
     ) -ForegroundColor Green
 
     # -----------------------------------------------------------------------
-    # Set the reporting-period start date
+    # Set reporting-period start date
     # -----------------------------------------------------------------------
 
     $StartDate = (
@@ -445,9 +443,7 @@ try {
                 $Country = "Unknown"
             }
             else {
-                $Country = (
-                    $Country.Trim().ToUpperInvariant()
-                )
+                $Country = $Country.Trim().ToUpperInvariant()
             }
 
             [PSCustomObject]@{
@@ -497,13 +493,8 @@ try {
     ) -ForegroundColor Green
 
     # -----------------------------------------------------------------------
-    # Identify targeted non-interactive lookup users
+    # Identify users requiring targeted non-interactive lookup
     # -----------------------------------------------------------------------
-
-    # The targeted lookup only applies to enabled Members who:
-    #   - Have no successful interactive sign-ins in the report period
-    #   - Have a last non-interactive sign-in date
-    #   - Have a last non-interactive date within the report period
 
     $TargetUsers = @(
         foreach ($Member in $EnabledMembers) {
@@ -523,8 +514,7 @@ try {
             }
 
             $LastNonInteractiveValue = (
-                $Member.SignInActivity.
-                    LastNonInteractiveSignInDateTime
+                $Member.SignInActivity.LastNonInteractiveSignInDateTime
             )
 
             $HasLastNonInteractiveValue = -not (
@@ -540,8 +530,7 @@ try {
                     $LastNonInteractiveDate = (
                         [datetimeoffset]::Parse(
                             [string]$LastNonInteractiveValue,
-                            [System.Globalization.CultureInfo]::
-                                InvariantCulture
+                            [System.Globalization.CultureInfo]::InvariantCulture
                         )
                     ).UtcDateTime
 
@@ -672,14 +661,12 @@ try {
 
     foreach ($UserId in $RecentInteractiveUserIds) {
         if ($UserLookup.ContainsKey($UserId)) {
-            $IncludedUsersById[$UserId] = (
-                $UserLookup[$UserId]
-            )
+            $IncludedUsersById[$UserId] = $UserLookup[$UserId]
         }
     }
 
     # -----------------------------------------------------------------------
-    # Build the internal report
+    # Build internal report
     # -----------------------------------------------------------------------
 
     Write-Host ""
@@ -723,9 +710,7 @@ try {
             }
             else {
                 $UsageLocation = (
-                    $User.UsageLocation.
-                        Trim().
-                        ToUpperInvariant()
+                    $User.UsageLocation.Trim().ToUpperInvariant()
                 )
             }
 
@@ -741,14 +726,12 @@ try {
 
             $LastInteractiveSignIn = ConvertTo-ReportDate `
                 -DateValue (
-                    $User.SignInActivity.
-                        LastSignInDateTime
+                    $User.SignInActivity.LastSignInDateTime
                 )
 
             $LastNonInteractiveSignIn = ConvertTo-ReportDate `
                 -DateValue (
-                    $User.SignInActivity.
-                        LastNonInteractiveSignInDateTime
+                    $User.SignInActivity.LastNonInteractiveSignInDateTime
                 )
 
             if (
@@ -832,7 +815,9 @@ try {
                     $UserPrincipalName
                 )
 
-                "User Type" = $UserType
+                "User Type" = (
+                    $UserType
+                )
 
                 "Account Enabled" = (
                     $AccountEnabled
@@ -878,7 +863,7 @@ try {
                 }
             }
 
-            # Unknown locations are excluded from the unique-country count.
+            # Unknown locations are excluded from unique-country count.
             $UserKnownCountries = @(
                 $CountryCounts.Keys |
                     Where-Object {
@@ -921,6 +906,16 @@ try {
             $Row["Sign-ins Outside Usage Location"] = (
                 $OutsideUsageLocation
             )
+
+            # Store the single observed country when there is exactly one.
+            if ($UserKnownCountries.Count -eq 1) {
+                $Row["Single Sign-in Country"] = (
+                    $UserKnownCountries[0]
+                )
+            }
+            else {
+                $Row["Single Sign-in Country"] = $null
+            }
 
             [PSCustomObject]$Row
         }
@@ -1011,12 +1006,44 @@ try {
             }
     )
 
-    # Only users with an observed country that differs from their
-    # configured Usage Location.
+    # Users with at least one observed country that differs from
+    # their configured Usage Location.
     $ExceptionsReport = @(
         $InternalReport |
             Where-Object {
                 $_."Sign-ins Outside Usage Location" -eq "Yes"
+            }
+    )
+
+    # Users with exactly one unique observed sign-in country and where
+    # that country differs from their configured Usage Location.
+    #
+    # IMPORTANT:
+    # The UsageLocation column in this report contains the OBSERVED
+    # sign-in country, as requested, not the user's configured Entra
+    # UsageLocation property.
+    $SingleCountryExceptionsReport = @(
+        $InternalReport |
+            Where-Object {
+                $_."Unique Country Count" -eq 1 -and
+                $_."Sign-ins Outside Usage Location" -eq "Yes"
+            } |
+            ForEach-Object {
+                if (
+                    -not [string]::IsNullOrWhiteSpace(
+                        $_."Single Sign-in Country"
+                    )
+                ) {
+                    [PSCustomObject]@{
+                        UserPrincipalName = (
+                            $_."User Principal Name"
+                        )
+
+                        UsageLocation = (
+                            $_."Single Sign-in Country"
+                        )
+                    }
+                }
             }
     )
 
@@ -1063,6 +1090,24 @@ try {
         -Columns $AllUsersColumns `
         -Path $ExceptionsOutputPath `
         -ReportName "Usage location exceptions report"
+
+    Write-Host ""
+
+    $SingleCountryExceptionsReport |
+        Sort-Object -Property UserPrincipalName |
+        Export-Csv `
+            -LiteralPath $SingleCountryExceptionsOutputPath `
+            -NoTypeInformation `
+            -Encoding UTF8 `
+            -Force
+
+    Write-Host (
+        "Single-country exceptions report: {0:N0} users" -f
+        $SingleCountryExceptionsReport.Count
+    ) -ForegroundColor Green
+
+    Write-Host "Output: $SingleCountryExceptionsOutputPath" `
+        -ForegroundColor Green
 
     Write-Host ""
     Write-Host "All reports completed successfully." `
