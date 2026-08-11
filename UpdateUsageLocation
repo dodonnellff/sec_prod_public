@@ -1,0 +1,48 @@
+# Prompt for CSV file path
+$CsvPath = Read-Host "Enter the full path to the CSV file"
+
+# Validate that the file exists
+if (-not (Test-Path -Path $CsvPath -PathType Leaf)) {
+    Write-Error "File not found: $CsvPath"
+    exit 1
+}
+
+# Connect to Microsoft Graph
+Connect-MgGraph -Scopes "User.ReadWrite.All" -NoWelcome
+
+# Import CSV
+$rows = Import-Csv -Path $CsvPath
+
+foreach ($row in $rows) {
+    $upn = $row.UserPrincipalName
+    $usageLocation = $row.UsageLocation
+
+    if ([string]::IsNullOrWhiteSpace($upn)) {
+        Write-Warning "Skipping row with blank UserPrincipalName."
+        continue
+    }
+
+    if ([string]::IsNullOrWhiteSpace($usageLocation)) {
+        Write-Warning "Skipping $upn because UsageLocation is blank."
+        continue
+    }
+
+    $upn = $upn.Trim()
+    $usageLocation = $usageLocation.Trim().ToUpper()
+
+    # Validate ISO 3166-1 alpha-2 country code
+    if ($usageLocation -notmatch '^[A-Z]{2}$') {
+        Write-Warning "Skipping $upn because '$usageLocation' is not a valid 2-letter country code."
+        continue
+    }
+
+    try {
+        Update-MgUser -UserId $upn -UsageLocation $usageLocation
+        Write-Host "Updated $upn -> $usageLocation" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to update $upn : $($_.Exception.Message)"
+    }
+}
+
+Disconnect-MgGraph
