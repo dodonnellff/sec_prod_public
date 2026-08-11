@@ -1,0 +1,940 @@
+<#
+.SYNOPSIS
+    Creates dynamic location groups, country named locations, and
+    Report-only Conditional Access geo-block policies based on
+    Microsoft Entra user.usageLocation.
+
+.DESCRIPTION
+
+    For each unique non-AU user.usageLocation:
+
+      - Creates a dynamic security group:
+            CAP Location - [COUNTRY]
+
+      - Creates a country Conditional Access named location:
+            [COUNTRY]
+
+      - Creates a Report-only Conditional Access policy:
+            FF [COUNTRY] User Geo-block policy
+
+    Also ensures:
+
+      - Australia named location exists.
+      - FF Default Geo-block Policy exists.
+
+    Default policy:
+      - All users included
+      - All discovered non-AU location groups excluded
+      - All resources
+      - All locations included
+      - Australia excluded
+      - Block
+      - Report-only
+
+    Country policy:
+      - Country dynamic group included
+      - All resources
+      - All locations included
+      - Australia excluded
+      - Country's named location excluded
+      - Block
+      - Report-only
+
+    Existing objects with matching names are not modified.
+
+.EXAMPLE
+    .\CAP_GeoblockSetup.ps1
+
+.EXAMPLE
+    .\CAP_GeoblockSetup.ps1 -WhatIf
+
+.NOTES
+    Required modules:
+
+        Microsoft.Graph.Authentication
+        Microsoft.Graph.Users
+        Microsoft.Graph.Groups
+        Microsoft.Graph.Identity.SignIns
+
+    Required delegated permissions:
+
+        User.Read.All
+        Group.ReadWrite.All
+        Policy.ReadWrite.ConditionalAccess
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param()
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+$ExcludedUsageLocation = 'AU'
+
+$GroupPrefix = 'CAP Location - '
+
+$DefaultPolicyName = 'FF Default Geo-block Policy'
+
+$CountryPolicyNameFormat = 'FF {0} User Geo-block policy'
+
+$AustraliaNamedLocationName = 'Australia'
+
+$GraphScopes = @(
+    'User.Read.All'
+    'Group.ReadWrite.All'
+    'Policy.ReadWrite.ConditionalAccess'
+)
+
+# ============================================================================
+# Required modules
+# ============================================================================
+
+$RequiredModules = @(
+    'Microsoft.Graph.Authentication'
+    'Microsoft.Graph.Users'
+    'Microsoft.Graph.Groups'
+    'Microsoft.Graph.Identity.SignIns'
+)
+
+foreach ($Module in $RequiredModules) {
+
+    if (-not (Get-Module -ListAvailable -Name $Module)) {
+        throw @"
+Required module '$Module' is not installed.
+
+Install it with:
+
+    Install-Module $Module -Scope CurrentUser
+"@
+    }
+
+    Import-Module $Module -ErrorAction Stop
+}
+
+# ============================================================================
+# Connect to Microsoft Graph
+# ============================================================================
+
+Write-Host ''
+Write-Host 'Connecting to Microsoft Graph...' -ForegroundColor Cyan
+
+Connect-MgGraph `
+    -Scopes $GraphScopes `
+    -NoWelcome
+
+# ============================================================================
+# Helper: Resolve ISO country code to country name
+# ============================================================================
+
+function Get-CountryName {
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]{2}$')]
+        [string]$CountryCode
+    )
+
+    $CountryCode = $CountryCode.ToUpperInvariant()
+
+    try {
+        $Region = [System.Globalization.RegionInfo]::new($CountryCode)
+        return $Region.EnglishName
+    }
+    catch {
+        Write-Warning "Unable to resolve country name for '$CountryCode'. Using ISO code."
+        return $CountryCode
+    }
+}
+
+# ============================================================================
+# Helper: Get named location OData type
+# ============================================================================
+
+function Get-NamedLocationType {
+    param(
+        [Parameter(Mandatory)]
+        $NamedLocation
+    )
+
+    if ($NamedLocation.AdditionalProperties) {
+        return $NamedLocation.AdditionalProperties['@odata.type']
+    }
+
+    return $null
+}
+
+# ============================================================================
+# Helper: Create Conditional Access policy through Graph REST API
+# ============================================================================
+
+function New-CapConditionalAccessPolicy {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Policy
+    )
+
+    $Json = $Policy | ConvertTo-Json -Depth 20
+
+    try {
+        $Response = Invoke-MgGraphRequest `
+            -Method POST `
+            -Uri 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies' `
+            -Body $Json `
+            -ContentType 'application/json' `
+            -ErrorAction Stop
+
+        return $Response
+    }
+    catch {
+        Write-Host ''
+        Write-Host 'Conditional Access policy creation failed.' -ForegroundColor Red
+        Write-Host "Graph error: $($_.Exception.Message)" -ForegroundColor Red
+
+        if ($_.ErrorDetails.Message) {
+            Write-Host 'Graph response:' -ForegroundColor Yellow
+            Write-Host $_.ErrorDetails.Message -ForegroundColor Yellow
+        }
+
+        throw
+    }
+}
+
+# ============================================================================
+# Retrieve users
+# ============================================================================
+
+Write-Host ''
+Write-Host 'Retrieving users and usageLocation...' -ForegroundColor Cyan
+
+$Users = Get-MgUser `
+    -All `
+    -Property 'id,displayName,userPrincipalName,usageLocation'
+
+$UsersWithLocation = @(
+    $Users |
+        Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.UsageLocation) -and
+            $_.UsageLocation.ToUpperInvariant() -ne $ExcludedUsageLocation
+        }
+)
+
+if ($UsersWithLocation.Count -eq 0) {
+    Write-Host ''
+    Write-Host "No users were found with a usageLocation other than $ExcludedUsageLocation." `
+        -ForegroundColor Yellow
+
+    return
+}
+
+# ============================================================================
+# Discover unique non-AU usage locations
+# ============================================================================
+
+$Locations = @(
+    $UsersWithLocation |
+        ForEach-Object {
+            $_.UsageLocation.ToUpperInvariant()
+        } |
+        Sort-Object -Unique
+)
+
+Write-Host ''
+Write-Host 'Discovered non-AU usage locations:' -ForegroundColor Green
+
+foreach ($Location in $Locations) {
+
+    $CountryName = Get-CountryName -CountryCode $Location
+
+    $UserCount = @(
+        $UsersWithLocation |
+            Where-Object {
+                $_.UsageLocation.ToUpperInvariant() -eq $Location
+            }
+    ).Count
+
+    Write-Host "  $Location - $CountryName - $UserCount user(s)"
+}
+
+# ============================================================================
+# Retrieve existing groups
+# ============================================================================
+
+Write-Host ''
+Write-Host 'Retrieving existing groups...' -ForegroundColor Cyan
+
+$ExistingGroups = @(
+    Get-MgGroup `
+        -All `
+        -Property `
+            'id,displayName,groupTypes,membershipRule,membershipRuleProcessingState'
+)
+
+# ============================================================================
+# Retrieve existing named locations
+# ============================================================================
+
+Write-Host 'Retrieving existing Conditional Access named locations...' `
+    -ForegroundColor Cyan
+
+$ExistingNamedLocations = @(
+    Get-MgIdentityConditionalAccessNamedLocation -All
+)
+
+# ============================================================================
+# Retrieve existing Conditional Access policies
+# ============================================================================
+
+Write-Host 'Retrieving existing Conditional Access policies...' `
+    -ForegroundColor Cyan
+
+$ExistingPolicies = @(
+    Get-MgIdentityConditionalAccessPolicy -All
+)
+
+# ============================================================================
+# Ensure Australia named location exists
+# ============================================================================
+
+Write-Host ''
+Write-Host 'Checking Australia named location...' -ForegroundColor Cyan
+
+$AustraliaNamedLocation = $ExistingNamedLocations |
+    Where-Object {
+        $_.DisplayName -eq $AustraliaNamedLocationName
+    } |
+    Select-Object -First 1
+
+if ($AustraliaNamedLocation) {
+
+    Write-Host `
+        "Named location already exists: $AustraliaNamedLocationName" `
+        -ForegroundColor Yellow
+
+    $AustraliaLocationType = Get-NamedLocationType `
+        -NamedLocation $AustraliaNamedLocation
+
+    if (
+        $AustraliaLocationType -and
+        $AustraliaLocationType -ne '#microsoft.graph.countryNamedLocation'
+    ) {
+        Write-Warning @"
+The existing named location '$AustraliaNamedLocationName' is not a
+countryNamedLocation. It will not be modified automatically.
+"@
+
+        $AustraliaNamedLocationId = $null
+    }
+    else {
+        $AustraliaNamedLocationId = $AustraliaNamedLocation.Id
+
+        Write-Host `
+            "Australia named location ID: $AustraliaNamedLocationId" `
+            -ForegroundColor DarkGray
+    }
+}
+else {
+
+    $AustraliaLocationParams = @{
+        '@odata.type' = '#microsoft.graph.countryNamedLocation'
+
+        displayName = $AustraliaNamedLocationName
+
+        countriesAndRegions = @(
+            'AU'
+        )
+
+        includeUnknownCountriesAndRegions = $false
+    }
+
+    if (
+        $PSCmdlet.ShouldProcess(
+            $AustraliaNamedLocationName,
+            'Create Australia country named location'
+        )
+    ) {
+
+        try {
+
+            $AustraliaNamedLocation = `
+                New-MgIdentityConditionalAccessNamedLocation `
+                    -BodyParameter $AustraliaLocationParams `
+                    -ErrorAction Stop
+
+            $AustraliaNamedLocationId = $AustraliaNamedLocation.Id
+
+            $ExistingNamedLocations += $AustraliaNamedLocation
+
+            Write-Host `
+                "Created Australia named location ($AustraliaNamedLocationId)." `
+                -ForegroundColor Green
+        }
+        catch {
+            throw "Failed to create Australia named location: $($_.Exception.Message)"
+        }
+    }
+    else {
+        $AustraliaNamedLocationId = $null
+    }
+}
+
+# ============================================================================
+# Create / verify dynamic groups and country named locations
+# ============================================================================
+
+$LocationObjects = @()
+
+foreach ($Location in $Locations) {
+
+    $CountryName = Get-CountryName -CountryCode $Location
+
+    $GroupName = "$GroupPrefix$CountryName"
+
+    $MembershipRule = "user.usageLocation -eq `"$Location`""
+
+    Write-Host ''
+    Write-Host '============================================================' `
+        -ForegroundColor DarkGray
+
+    Write-Host "Processing $Location - $CountryName" `
+        -ForegroundColor Cyan
+
+    Write-Host '============================================================' `
+        -ForegroundColor DarkGray
+
+    # ------------------------------------------------------------------------
+    # Dynamic group
+    # ------------------------------------------------------------------------
+
+    $ExistingGroup = $ExistingGroups |
+        Where-Object {
+            $_.DisplayName -eq $GroupName
+        } |
+        Select-Object -First 1
+
+    if ($ExistingGroup) {
+
+        Write-Host "Group already exists: $GroupName" `
+            -ForegroundColor Yellow
+
+        $GroupId = $ExistingGroup.Id
+        $GroupAction = 'Existing'
+
+        $IsDynamic = $ExistingGroup.GroupTypes -contains 'DynamicMembership'
+
+        if (-not $IsDynamic) {
+            Write-Warning `
+                "Existing group '$GroupName' is not a dynamic group."
+        }
+        elseif ($ExistingGroup.MembershipRule -ne $MembershipRule) {
+            Write-Warning @"
+Existing group '$GroupName' has a different membership rule.
+
+Existing:
+    $($ExistingGroup.MembershipRule)
+
+Expected:
+    $MembershipRule
+
+No changes were made.
+"@
+        }
+    }
+    else {
+
+        $MailNickname = $GroupName -replace '[^A-Za-z0-9]', ''
+
+        if ([string]::IsNullOrWhiteSpace($MailNickname)) {
+            $MailNickname = "CAPLocation$Location"
+        }
+
+        if ($MailNickname.Length -gt 64) {
+            $MailNickname = $MailNickname.Substring(0, 64)
+        }
+
+        $GroupParams = @{
+            DisplayName = $GroupName
+
+            Description = `
+                "Dynamic security group for users with usageLocation $Location ($CountryName)."
+
+            GroupTypes = @(
+                'DynamicMembership'
+            )
+
+            MembershipRule = $MembershipRule
+
+            MembershipRuleProcessingState = 'On'
+
+            MailEnabled = $false
+
+            MailNickname = $MailNickname
+
+            SecurityEnabled = $true
+        }
+
+        if (
+            $PSCmdlet.ShouldProcess(
+                $GroupName,
+                "Create dynamic security group with rule '$MembershipRule'"
+            )
+        ) {
+
+            try {
+
+                $NewGroup = New-MgGroup `
+                    @GroupParams `
+                    -ErrorAction Stop
+
+                $GroupId = $NewGroup.Id
+                $GroupAction = 'Created'
+
+                $ExistingGroups += $NewGroup
+
+                Write-Host `
+                    "Created dynamic group: $GroupName ($GroupId)" `
+                    -ForegroundColor Green
+            }
+            catch {
+
+                Write-Error `
+                    "Failed to create group '$GroupName': $($_.Exception.Message)"
+
+                $GroupId = $null
+                $GroupAction = 'Failed'
+            }
+        }
+        else {
+
+            $GroupId = $null
+            $GroupAction = 'WhatIf'
+        }
+    }
+
+    # ------------------------------------------------------------------------
+    # Country named location
+    # ------------------------------------------------------------------------
+
+    $ExistingCountryLocation = $ExistingNamedLocations |
+        Where-Object {
+            $_.DisplayName -eq $CountryName
+        } |
+        Select-Object -First 1
+
+    if ($ExistingCountryLocation) {
+
+        Write-Host `
+            "Named location already exists: $CountryName" `
+            -ForegroundColor Yellow
+
+        $CountryNamedLocationId = $ExistingCountryLocation.Id
+        $NamedLocationAction = 'Existing'
+
+        $CountryLocationType = Get-NamedLocationType `
+            -NamedLocation $ExistingCountryLocation
+
+        if (
+            $CountryLocationType -and
+            $CountryLocationType -ne '#microsoft.graph.countryNamedLocation'
+        ) {
+            Write-Warning @"
+Named location '$CountryName' exists, but is not a countryNamedLocation.
+
+No changes were made.
+"@
+        }
+        else {
+
+            $ExistingCountries = @(
+                $ExistingCountryLocation.AdditionalProperties[
+                    'countriesAndRegions'
+                ]
+            )
+
+            if (
+                $ExistingCountries.Count -gt 0 -and
+                $Location -notin $ExistingCountries
+            ) {
+                Write-Warning @"
+Named location '$CountryName' does not contain country code '$Location'.
+
+No changes were made.
+"@
+            }
+        }
+    }
+    else {
+
+        $CountryLocationParams = @{
+            '@odata.type' = '#microsoft.graph.countryNamedLocation'
+
+            displayName = $CountryName
+
+            countriesAndRegions = @(
+                $Location
+            )
+
+            includeUnknownCountriesAndRegions = $false
+        }
+
+        if (
+            $PSCmdlet.ShouldProcess(
+                $CountryName,
+                "Create Conditional Access country named location for $Location"
+            )
+        ) {
+
+            try {
+
+                $NewCountryLocation = `
+                    New-MgIdentityConditionalAccessNamedLocation `
+                        -BodyParameter $CountryLocationParams `
+                        -ErrorAction Stop
+
+                $CountryNamedLocationId = $NewCountryLocation.Id
+                $NamedLocationAction = 'Created'
+
+                $ExistingNamedLocations += $NewCountryLocation
+
+                Write-Host `
+                    "Created country named location: $CountryName ($CountryNamedLocationId)" `
+                    -ForegroundColor Green
+            }
+            catch {
+
+                Write-Error `
+                    "Failed to create named location '$CountryName': $($_.Exception.Message)"
+
+                $CountryNamedLocationId = $null
+                $NamedLocationAction = 'Failed'
+            }
+        }
+        else {
+
+            $CountryNamedLocationId = $null
+            $NamedLocationAction = 'WhatIf'
+        }
+    }
+
+    # ------------------------------------------------------------------------
+    # Save location information for policy creation
+    # ------------------------------------------------------------------------
+
+    $LocationObjects += [PSCustomObject]@{
+        CountryCode = $Location
+        CountryName = $CountryName
+        GroupName = $GroupName
+        GroupId = $GroupId
+        GroupAction = $GroupAction
+        NamedLocationId = $CountryNamedLocationId
+        NamedLocationAction = $NamedLocationAction
+    }
+}
+
+# ============================================================================
+# Create / verify default geo-block policy
+# ============================================================================
+
+Write-Host ''
+Write-Host 'Processing default geo-block policy...' -ForegroundColor Cyan
+
+$ExistingDefaultPolicy = $ExistingPolicies |
+    Where-Object {
+        $_.DisplayName -eq $DefaultPolicyName
+    } |
+    Select-Object -First 1
+
+if ($ExistingDefaultPolicy) {
+
+    Write-Host `
+        "Policy already exists: $DefaultPolicyName" `
+        -ForegroundColor Yellow
+
+    $DefaultPolicyAction = 'Existing'
+}
+elseif (-not $AustraliaNamedLocationId) {
+
+    Write-Warning @"
+Cannot create '$DefaultPolicyName' because the Australia named
+location ID is unavailable.
+"@
+
+    $DefaultPolicyAction = 'Failed'
+}
+else {
+
+    $DefaultExcludedGroups = @(
+        $LocationObjects |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_.GroupId)
+            } |
+            Select-Object -ExpandProperty GroupId
+    )
+
+    $DefaultPolicyParams = @{
+        displayName = $DefaultPolicyName
+
+        state = 'enabledForReportingButNotEnforced'
+
+        conditions = @{
+            clientAppTypes = @(
+                'all'
+            )
+
+            applications = @{
+                includeApplications = @(
+                    'All'
+                )
+            }
+
+            users = @{
+                includeUsers = @(
+                    'All'
+                )
+
+                excludeGroups = $DefaultExcludedGroups
+            }
+
+            locations = @{
+                includeLocations = @(
+                    'All'
+                )
+
+                excludeLocations = @(
+                    $AustraliaNamedLocationId
+                )
+            }
+        }
+
+        grantControls = @{
+            operator = 'OR'
+
+            builtInControls = @(
+                'block'
+            )
+        }
+    }
+
+    if (
+        $PSCmdlet.ShouldProcess(
+            $DefaultPolicyName,
+            'Create Report-only default geo-block Conditional Access policy'
+        )
+    ) {
+
+        try {
+
+            $NewDefaultPolicy = New-CapConditionalAccessPolicy `
+                -Policy $DefaultPolicyParams
+
+            $ExistingPolicies += $NewDefaultPolicy
+
+            $DefaultPolicyAction = 'Created'
+
+            Write-Host `
+                "Created Report-only policy: $DefaultPolicyName" `
+                -ForegroundColor Green
+        }
+        catch {
+
+            $DefaultPolicyAction = 'Failed'
+        }
+    }
+    else {
+
+        $DefaultPolicyAction = 'WhatIf'
+    }
+}
+
+# ============================================================================
+# Create / verify country geo-block policies
+# ============================================================================
+
+$CountryPolicyResults = @()
+
+foreach ($LocationObject in $LocationObjects) {
+
+    $CountryCode = $LocationObject.CountryCode
+    $CountryName = $LocationObject.CountryName
+
+    $PolicyName = $CountryPolicyNameFormat -f $CountryName
+
+    Write-Host ''
+    Write-Host "Processing country policy: $PolicyName" `
+        -ForegroundColor Cyan
+
+    $ExistingCountryPolicy = $ExistingPolicies |
+        Where-Object {
+            $_.DisplayName -eq $PolicyName
+        } |
+        Select-Object -First 1
+
+    if ($ExistingCountryPolicy) {
+
+        Write-Host `
+            "Policy already exists: $PolicyName" `
+            -ForegroundColor Yellow
+
+        $PolicyAction = 'Existing'
+    }
+    elseif (-not $LocationObject.GroupId) {
+
+        Write-Warning @"
+Cannot create '$PolicyName' because the dynamic group ID is unavailable.
+"@
+
+        $PolicyAction = 'Failed'
+    }
+    elseif (-not $LocationObject.NamedLocationId) {
+
+        Write-Warning @"
+Cannot create '$PolicyName' because the $CountryName named location
+ID is unavailable.
+"@
+
+        $PolicyAction = 'Failed'
+    }
+    elseif (-not $AustraliaNamedLocationId) {
+
+        Write-Warning @"
+Cannot create '$PolicyName' because the Australia named location
+ID is unavailable.
+"@
+
+        $PolicyAction = 'Failed'
+    }
+    else {
+
+        $CountryPolicyParams = @{
+            displayName = $PolicyName
+
+            state = 'enabledForReportingButNotEnforced'
+
+            conditions = @{
+                clientAppTypes = @(
+                    'all'
+                )
+
+                applications = @{
+                    includeApplications = @(
+                        'All'
+                    )
+                }
+
+                users = @{
+                    includeGroups = @(
+                        $LocationObject.GroupId
+                    )
+                }
+
+                locations = @{
+                    includeLocations = @(
+                        'All'
+                    )
+
+                    excludeLocations = @(
+                        $AustraliaNamedLocationId
+                        $LocationObject.NamedLocationId
+                    )
+                }
+            }
+
+            grantControls = @{
+                operator = 'OR'
+
+                builtInControls = @(
+                    'block'
+                )
+            }
+        }
+
+        if (
+            $PSCmdlet.ShouldProcess(
+                $PolicyName,
+                'Create Report-only country geo-block Conditional Access policy'
+            )
+        ) {
+
+            try {
+
+                $NewCountryPolicy = New-CapConditionalAccessPolicy `
+                    -Policy $CountryPolicyParams
+
+                $ExistingPolicies += $NewCountryPolicy
+
+                $PolicyAction = 'Created'
+
+                Write-Host `
+                    "Created Report-only policy: $PolicyName" `
+                    -ForegroundColor Green
+            }
+            catch {
+
+                $PolicyAction = 'Failed'
+            }
+        }
+        else {
+
+            $PolicyAction = 'WhatIf'
+        }
+    }
+
+    $CountryPolicyResults += [PSCustomObject]@{
+        CountryCode = $CountryCode
+        CountryName = $CountryName
+        Group = $LocationObject.GroupName
+        GroupId = $LocationObject.GroupId
+        NamedLocation = $CountryName
+        NamedLocationId = $LocationObject.NamedLocationId
+        Policy = $PolicyName
+        PolicyAction = $PolicyAction
+    }
+}
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+Write-Host ''
+Write-Host '============================================================' `
+    -ForegroundColor Cyan
+
+Write-Host 'SUMMARY' -ForegroundColor Cyan
+
+Write-Host '============================================================' `
+    -ForegroundColor Cyan
+
+Write-Host ''
+Write-Host 'Location objects:' -ForegroundColor White
+
+$LocationObjects |
+    Select-Object `
+        CountryCode,
+        CountryName,
+        GroupName,
+        GroupAction,
+        NamedLocationAction |
+    Format-Table -AutoSize
+
+Write-Host ''
+Write-Host 'Default policy:' -ForegroundColor White
+
+[PSCustomObject]@{
+    Policy = $DefaultPolicyName
+    Action = $DefaultPolicyAction
+} |
+    Format-Table -AutoSize
+
+Write-Host ''
+Write-Host 'Country policies:' -ForegroundColor White
+
+$CountryPolicyResults |
+    Select-Object `
+        CountryCode,
+        CountryName,
+        Policy,
+        PolicyAction |
+    Format-Table -AutoSize
+
+Write-Host ''
+Write-Host 'Completed.' -ForegroundColor Green
+Disconnect-MgGraph
