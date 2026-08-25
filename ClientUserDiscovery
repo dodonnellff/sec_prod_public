@@ -293,6 +293,10 @@ $SingleCountryExceptionsOutputPath = Join-Path `
     -Path $OutputDirectory `
     -ChildPath "UserSignInReport-Single-Country-Exceptions.csv"
 
+$TwoCountryAustraliaOutputPath = Join-Path `
+    -Path $OutputDirectory `
+    -ChildPath "UserSignInReport-Two-Countries-Including-AU.csv"
+
 if (-not (Test-Path -LiteralPath $OutputDirectory)) {
     New-Item `
         -Path $OutputDirectory `
@@ -709,9 +713,7 @@ try {
                 $UsageLocation = "Not Set"
             }
             else {
-                $UsageLocation = (
-                    $User.UsageLocation.Trim().ToUpperInvariant()
-                )
+                $UsageLocation = $User.UsageLocation.Trim().ToUpperInvariant()
             }
 
             if ($null -eq $User.AccountEnabled) {
@@ -725,14 +727,11 @@ try {
             }
 
             $LastInteractiveSignIn = ConvertTo-ReportDate `
-                -DateValue (
-                    $User.SignInActivity.LastSignInDateTime
-                )
+                -DateValue $User.SignInActivity.LastSignInDateTime
 
             $LastNonInteractiveSignIn = ConvertTo-ReportDate `
-                -DateValue (
+                -DateValue `
                     $User.SignInActivity.LastNonInteractiveSignInDateTime
-                )
 
             if (
                 $InteractiveSignInsByUserId.ContainsKey(
@@ -811,29 +810,17 @@ try {
             $Row = [ordered]@{
                 "User Name" = $UserName
 
-                "User Principal Name" = (
-                    $UserPrincipalName
-                )
+                "User Principal Name" = $UserPrincipalName
 
-                "User Type" = (
-                    $UserType
-                )
+                "User Type" = $UserType
 
-                "Account Enabled" = (
-                    $AccountEnabled
-                )
+                "Account Enabled" = $AccountEnabled
 
-                "Usage Location" = (
-                    $UsageLocation
-                )
+                "Usage Location" = $UsageLocation
 
-                "Last Interactive Sign-in" = (
-                    $LastInteractiveSignIn
-                )
+                "Last Interactive Sign-in" = $LastInteractiveSignIn
 
-                "Last Non-Interactive Sign-in" = (
-                    $LastNonInteractiveSignIn
-                )
+                "Last Non-Interactive Sign-in" = $LastNonInteractiveSignIn
 
                 "Interactive Sign-ins in Period" = (
                     $InteractiveSignInCount
@@ -847,16 +834,12 @@ try {
                     $RecentSignInCount
                 )
 
-                "Country Data Source" = (
-                    $CountrySource
-                )
+                "Country Data Source" = $CountrySource
             }
 
             foreach ($Country in $Countries) {
                 if ($CountryCounts.ContainsKey($Country)) {
-                    $Row[$Country] = (
-                        $CountryCounts[$Country]
-                    )
+                    $Row[$Country] = $CountryCounts[$Country]
                 }
                 else {
                     $Row[$Country] = 0
@@ -877,9 +860,7 @@ try {
             )
 
             if ($UserKnownCountries.Count -eq 0) {
-                $OutsideUsageLocation = (
-                    "No Recent Sign-ins"
-                )
+                $OutsideUsageLocation = "No Recent Sign-ins"
             }
             elseif (
                 $UsageLocation -in @(
@@ -907,7 +888,6 @@ try {
                 $OutsideUsageLocation
             )
 
-            # Store the single observed country when there is exactly one.
             if ($UserKnownCountries.Count -eq 1) {
                 $Row["Single Sign-in Country"] = (
                     $UserKnownCountries[0]
@@ -1015,13 +995,12 @@ try {
             }
     )
 
-    # Users with exactly one unique observed sign-in country and where
-    # that country differs from their configured Usage Location.
+    # Users with exactly one unique observed sign-in country, where that
+    # country differs from their configured Usage Location.
     #
     # IMPORTANT:
     # The UsageLocation column in this report contains the OBSERVED
-    # sign-in country, as requested, not the user's configured Entra
-    # UsageLocation property.
+    # sign-in country, not the configured Entra UsageLocation property.
     $SingleCountryExceptionsReport = @(
         $InternalReport |
             Where-Object {
@@ -1042,6 +1021,56 @@ try {
                         UsageLocation = (
                             $_."Single Sign-in Country"
                         )
+                    }
+                }
+            }
+    )
+
+    # Users with exactly two unique observed sign-in countries,
+    # where one is AU.
+    #
+    # The UsageLocation column contains ONLY the non-AU observed country.
+    $TwoCountryAustraliaReport = @(
+        $InternalReport |
+            Where-Object {
+                $_."Unique Country Count" -eq 2
+            } |
+            ForEach-Object {
+                $ObservedCountries = @()
+
+                foreach ($Country in $Countries) {
+                    if (
+                        $Country -ne "Unknown" -and
+                        [int]$_.$Country -gt 0
+                    ) {
+                        $ObservedCountries += $Country
+                    }
+                }
+
+                if (
+                    $ObservedCountries.Count -eq 2 -and
+                    $ObservedCountries -contains "AU"
+                ) {
+                    $NonAUCountry = (
+                        $ObservedCountries |
+                            Where-Object {
+                                $_ -ne "AU"
+                            } |
+                            Select-Object -First 1
+                    )
+
+                    if (
+                        -not [string]::IsNullOrWhiteSpace(
+                            $NonAUCountry
+                        )
+                    ) {
+                        [PSCustomObject]@{
+                            UserPrincipalName = (
+                                $_."User Principal Name"
+                            )
+
+                            UsageLocation = $NonAUCountry
+                        }
                     }
                 }
             }
@@ -1107,6 +1136,24 @@ try {
     ) -ForegroundColor Green
 
     Write-Host "Output: $SingleCountryExceptionsOutputPath" `
+        -ForegroundColor Green
+
+    Write-Host ""
+
+    $TwoCountryAustraliaReport |
+        Sort-Object -Property UserPrincipalName |
+        Export-Csv `
+            -LiteralPath $TwoCountryAustraliaOutputPath `
+            -NoTypeInformation `
+            -Encoding UTF8 `
+            -Force
+
+    Write-Host (
+        "Two-country AU report: {0:N0} users" -f
+        $TwoCountryAustraliaReport.Count
+    ) -ForegroundColor Green
+
+    Write-Host "Output: $TwoCountryAustraliaOutputPath" `
         -ForegroundColor Green
 
     Write-Host ""
