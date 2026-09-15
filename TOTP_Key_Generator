@@ -1,0 +1,38 @@
+function Generate-RandomBase32 {
+    $alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    $random = New-Object System.Random
+    -join (1..32 | ForEach-Object { $alphabet[$random.Next(0, $alphabet.Length)] })
+}
+
+function Convert-Base32ToHex {
+    param (
+        [string]$base32
+    )
+
+    $base32 = $base32.ToUpper().TrimEnd('=')
+    $alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    $bitString = ""
+
+    foreach ($char in $base32.ToCharArray()) {
+        $index = $alphabet.IndexOf($char)
+        if ($index -lt 0) { throw "Invalid Base32 character: $char" }
+        $bitString += [Convert]::ToString($index, 2).PadLeft(5, '0')
+    }
+
+    $hex = ""
+    for ($i = 0; $i -lt $bitString.Length; $i += 8) {
+        $chunk = $bitString.Substring($i, [Math]::Min(8, $bitString.Length - $i))
+        $hex += [Convert]::ToByte($chunk.PadRight(8, '0'), 2).ToString("x2")
+    }
+
+    return $hex
+}
+
+# Main
+$base32 = Generate-RandomBase32
+$hex = Convert-Base32ToHex -base32 $base32
+
+Write-Host "Base32 Secret is for the TOTP in Vault, Hex Key is for the HardwareToken Import in DUO"
+Write-Host "Base32 Secret: $base32"
+Write-Host "Hex Key      : $hex"
+Read-Host
