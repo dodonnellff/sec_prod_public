@@ -1,0 +1,233 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ApiKey,
+
+    [Parameter(Mandatory = $false)]
+    [SecureString]$ApiSecret,
+
+    [ValidateSet('expected', 'unauthorized')]
+    [string]$Type,
+
+    [ValidateSet('active', 'scheduled', 'expired')]
+    [string]$Status,
+
+    [ValidateSet('account', 'organization', 'identity')]
+    [string]$Scope,
+
+    [ValidateSet('country', 'vpn', 'ip_address')]
+    [string]$Category,
+
+    [string]$CountryCode,
+    [string]$Vpn,
+    [string]$IpAddress,
+
+    [ValidateSet('standard', 'catchall', 'catchall_exception')]
+    [string]$Logic,
+
+    [int]$OrganizationId,
+    [int]$IdentityId,
+
+    # Match a username/email against the returned rule objects.
+    [string]$UserName,
+
+    [ValidateRange(1, 500)]
+    [int]$PageSize = 500
+)
+
+$ErrorActionPreference = 'Stop'
+$baseUri = 'https://api.huntress.io/v1/unwanted_access_rules'
+
+function ConvertTo-PlainText {
+    param([Parameter(Mandatory)] [SecureString]$Value)
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+if (-not $ApiSecret) {
+    $ApiSecret = Read-Host 'Huntress API secret' -AsSecureString
+}
+
+$plainSecret = ConvertTo-PlainText -Value $ApiSecret
+$credentialBytes = [Text.Encoding]::UTF8.GetBytes("$ApiKey`:$plainSecret")
+$basicCredential = [Convert]::ToBase64String($credentialBytes)
+
+$headers = @{
+    Authorization = "Basic $basicCredential"
+    Accept        = 'application/json'
+}
+
+if ($UserName -and $IdentityId) {
+    throw 'Specify either -UserName or -IdentityId, not both.'
+}
+
+if (-not $UserName -and -not $IdentityId) {
+    $UserName = Read-Host 'Specific username/email (leave blank for all users)'
+}
+
+if ($UserName -and -not $CountryCode) {
+    $CountryCode = Read-Host 'Country code (ISO alpha-2, e.g. AU)'
+}
+
+if ($CountryCode -and $CountryCode -notmatch '^[A-Za-z]{2}$') {
+    throw "Country code must be exactly two letters in ISO alpha-2 format, for example AU."
+}
+
+if ($CountryCode) {
+    $CountryCode = $CountryCode.ToUpperInvariant()
+}
+
+$query = [ordered]@{ limit = $PageSize }
+foreach ($item in @{
+    organization_id = $OrganizationId
+    identity_id     = $IdentityId
+    type            = $Type
+    status          = $Status
+    scope           = $Scope
+    category        = $Category
+    # When a user is supplied, retrieve that user's country rules locally so
+    # an existing rule for another country can provide the identity ID.
+    country_code    = if ($UserName) { $null } else { $CountryCode }
+    vpn             = $Vpn
+    ip_address      = $IpAddress
+    logic           = $Logic
+}.GetEnumerator()) {
+    if ($null -ne $item.Value -and $item.Value -ne '') {
+        $query[$item.Key] = $item.Value
+    }
+}
+
+$rules = [System.Collections.Generic.List[object]]::new()
+$requestUri = $baseUri
+$firstRequest = $true
+
+try {
+    do {
+        if ($firstRequest) {
+            $queryString = ($query.GetEnumerator() | ForEach-Object {
+                '{0}={1}' -f [Uri]::EscapeDataString([string]$_.Key), [Uri]::EscapeDataString([string]$_.Value)
+            }) -join '&'
+            $requestUri = "$baseUri`?$queryString"
+            $firstRequest = $false
+        }
+
+        Write-Verbose "GET $requestUri"
+        $response = Invoke-RestMethod -Method Get -Uri $requestUri -Headers $headers
+
+        foreach ($rule in @($response.unwanted_access_rules)) {
+            [void]$rules.Add($rule)
+        }
+
+        $requestUri = $response.pagination.next_page_url
+    } while ($requestUri)
+}
+catch {
+    $statusCode = $_.Exception.Response.StatusCode.value__
+    $detail = $_.ErrorDetails.Message
+    if ($statusCode) {
+        throw "Huntress API request failed with HTTP $statusCode. $detail"
+    }
+    throw
+}
+finally {
+    $plainSecret = $null
+    $credentialBytes = $null
+    $basicCredential = $null
+}
+
+if ($UserName) {
+    # Keep the unfiltered result available so an existing rule can provide the
+    # identity ID needed if a new country rule must be created.
+    $allUserRules = @($rules | Where-Object {
+        $_.applied_to.name -ieq $UserName -or
+        $_.applied_to.username -ieq $UserName -or
+        $_.applied_to.email -ieq $UserName
+    })
+
+    $rules = [System.Collections.Generic.List[object]]@(
+        $allUserRules | Where-Object {
+            -not $CountryCode -or $_.country_code -ieq $CountryCode
+        }
+    )
+    Write-Verbose "Matched $($rules.Count) rule(s) for '$UserName'."
+
+    $hadMatchingRule = $rules.Count -gt 0
+    if ($hadMatchingRule) {
+        foreach ($rule in @($rules)) {
+            $delete = Read-Host "Rule ID $($rule.id) matches user '$UserName' and country '$CountryCode' (type: $($rule.type)). Delete it? (Y/N)"
+            if ($delete -match '^[Yy]$') {
+                try {
+                    Invoke-RestMethod -Method Delete -Uri "$baseUri/$($rule.id)" -Headers $headers | Out-Null
+                    [void]$rules.Remove($rule)
+                    Write-Host "Deleted unwanted access rule $($rule.id)." -ForegroundColor Yellow
+                }
+                catch {
+                    $statusCode = $_.Exception.Response.StatusCode.value__
+                    $detail = $_.ErrorDetails.Message
+                    if ($statusCode) {
+                        throw "Failed to delete Huntress rule $($rule.id) with HTTP $statusCode. $detail"
+                    }
+                    throw
+                }
+            }
+        }
+    }
+
+    if ($CountryCode -and -not $hadMatchingRule -and $rules.Count -eq 0) {
+        $create = Read-Host "No rule found for '$UserName' and country '$CountryCode'. Create an unauthorized rule? (Y/N)"
+        if ($create -match '^[Yy]$') {
+            $resolvedIdentityId = $IdentityId
+            if (-not $resolvedIdentityId -and $allUserRules.Count -gt 0) {
+                $resolvedIdentityId = $allUserRules[0].applied_to.id
+            }
+            if (-not $resolvedIdentityId) {
+                Write-Verbose "No identity ID found in existing rules. Looking up enabled, billable identities."
+                $identityUri = 'https://api.huntress.io/v1/identities?limit=500&enabled=true&billable=true'
+                $identityMatches = [System.Collections.Generic.List[object]]::new()
+
+                do {
+                    Write-Verbose "GET $identityUri"
+                    $identityResponse = Invoke-RestMethod -Method Get -Uri $identityUri -Headers $headers
+                    foreach ($identity in @($identityResponse.identities)) {
+                        if ($identity.username -ieq $UserName -or $identity.email -ieq $UserName) {
+                            [void]$identityMatches.Add($identity)
+                        }
+                    }
+                    $identityUri = $identityResponse.pagination.next_page_url
+                } while ($identityUri)
+
+                if ($identityMatches.Count -eq 1) {
+                    $resolvedIdentityId = $identityMatches[0].id
+                }
+                elseif ($identityMatches.Count -gt 1) {
+                    throw "More than one enabled, billable identity matched '$UserName'. Use -IdentityId instead."
+                }
+                else {
+                    throw "No enabled, billable Huntress identity was found for '$UserName'."
+                }
+            }
+
+            $body = @{
+                identity_id  = [int64]$resolvedIdentityId
+                country_code = $CountryCode
+                type         = 'expected'
+            } | ConvertTo-Json
+
+            $created = Invoke-RestMethod -Method Post -Uri $baseUri -Headers $headers -ContentType 'application/json' -Body $body
+            Write-Host "Created unauthorized access rule $($created.unwanted_access_rule.id) for '$UserName' and country '$CountryCode'." -ForegroundColor Green
+            $rules.Add($created.unwanted_access_rule)
+        }
+    }
+}
+
+Write-Host "Retrieved $($rules.Count) unwanted access rule(s)." -ForegroundColor Green
+$rules | Select-Object id, category, country_code, vpn, ip_address, type, logic, scope, applied_to, starts_at, expires_at, notes, created_at, updated_at | Format-Table -AutoSize
+
+# The raw objects remain available to callers when this script is dot-sourced or invoked from another script.
+$rules
